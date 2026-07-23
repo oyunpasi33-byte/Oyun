@@ -1,0 +1,422 @@
+// client/js/app.js
+// Tüm istemci mantığı: socket bağlantısı, ekran geçişleri, oyun durumu render'ı.
+// Modüler bir "state + render" deseni kullanılır: sunucudan gelen her olay
+// yerel state'i günceller, ardından ilgili render fonksiyonu çağrılır.
+
+(function () {
+  'use strict';
+
+  const socket = io();
+
+  // ---------------- Yerel durum ----------------
+  const state = {
+    myId: null,
+    roomCode: null,
+    myName: '',
+    oppName: 'Rakip',
+    duration: 5 * 60 * 1000,
+    endsAt: null,
+    clockInterval: null,
+    currentQuestion: null, // { id, timeLimit, startedAt }
+    questionInterval: null,
+  };
+
+  // ---------------- DOM yardımcıları ----------------
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => document.querySelectorAll(sel);
+
+  function showScreen(id) {
+    $$('.screen').forEach((el) => el.classList.remove('active'));
+    $(id).classList.add('active');
+  }
+
+  function showError(msg) {
+    const el = $('#landing-error');
+    el.textContent = msg;
+    el.hidden = false;
+  }
+
+  function toast(message) {
+    const stack = $('#toast-stack');
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = message;
+    stack.appendChild(el);
+    setTimeout(() => el.remove(), 3600);
+  }
+
+  const ERROR_MESSAGES = {
+    ODA_DOLU: 'Bu oda zaten dolu.',
+    ODA_BULUNAMADI: 'Böyle bir oda bulunamadı. Kodu kontrol et.',
+    OYUN_BASLADI: 'Bu odadaki oyun zaten başladı.',
+  };
+
+  // ==================================================================
+  // EKRAN 1: Giriş — sekme geçişleri + oda kurma/katılma
+  // ==================================================================
+  $$('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      $$('.tab-btn').forEach((b) => b.classList.remove('active'));
+      $$('.tab-panel').forEach((p) => p.classList.remove('active'));
+      btn.classList.add('active');
+      $(`.tab-panel[data-panel="${btn.dataset.tab}"]`).classList.add('active');
+      $('#landing-error').hidden = true;
+    });
+  });
+
+  $('#btn-create-room').addEventListener('click', () => {
+    const name = $('#name-create').value.trim();
+    if (!name) return showError('Lütfen bir kumandan adı gir.');
+    state.myName = name;
+    socket.emit('createRoom', { playerName: name });
+  });
+
+  $('#btn-join-room').addEventListener('click', () => {
+    const name = $('#name-join').value.trim();
+    const code = $('#code-join').value.trim().toUpperCase();
+    if (!name) return showError('Lütfen bir kumandan adı gir.');
+    if (!code) return showError('Lütfen oda kodunu gir.');
+    state.myName = name;
+    socket.emit('joinRoom', { roomCode: code, playerName: name });
+  });
+
+  // URL'de ?room=KOD varsa otomatik olarak "Odaya Katıl" sekmesini aç ve kodu doldur
+  (function checkUrlRoomParam() {
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get('room');
+    if (roomParam) {
+      $('.tab-btn[data-tab="join"]').click();
+      $('#code-join').value = roomParam.toUpperCase();
+    }
+  })();
+
+  // ==================================================================
+  // Sunucu olayları: oda oluşturma / katılma
+  // ==================================================================
+  socket.on('roomCreated', ({ roomCode, playerId }) => enterLobby(roomCode, playerId));
+  socket.on('roomJoined', ({ roomCode, playerId }) => enterLobby(roomCode, playerId));
+  socket.on('roomError', ({ message }) => showError(ERROR_MESSAGES[message] || 'Bir hata oluştu.'));
+
+  function enterLobby(roomCode, playerId) {
+    state.roomCode = roomCode;
+    state.myId = playerId;
+    $('#room-code-display').textContent = roomCode;
+    showScreen('#screen-lobby');
+    history.replaceState(null, '', `?room=${roomCode}`);
+  }
+
+  $('#btn-copy-link').addEventListener('click', async () => {
+    const url = `${window.location.origin}${window.location.pathname}?room=${state.roomCode}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('Davet linki kopyalandı!');
+    } catch (e) {
+      toast(`Link: ${url}`);
+    }
+  });
+
+  $('#btn-ready').addEventListener('click', () => {
+    const btn = $('#btn-ready');
+    const nowReady = btn.dataset.ready !== 'true';
+    btn.dataset.ready = String(nowReady);
+    btn.textContent = nowReady ? '✅ Hazır!' : '🛡️ Hazırım';
+    socket.emit('playerReady', { roomCode: state.roomCode, ready: nowReady });
+  });
+
+  // ==================================================================
+  // EKRAN 2: Lobi güncellemesi
+  // ==================================================================
+  socket.on('lobbyUpdate', ({ players }) => {
+    const box = $('#lobby-players');
+    box.innerHTML = '';
+    players.forEach((p) => {
+      const row = document.createElement('div');
+      row.className = 'lobby-player-row' + (p.ready ? ' is-ready' : '');
+      const you = p.id === state.myId ? ' (Sen)' : '';
+      row.innerHTML = `<span>${escapeHtml(p.name)}${you}</span><span class="ready-pill">${p.ready ? 'HAZIR' : 'Bekliyor'}</span>`;
+      box.appendChild(row);
+    });
+    if (players.length < 2) {
+      $('#lobby-hint').textContent = 'Arkadaşının katılmasını bekliyorsun...';
+    } else {
+      $('#lobby-hint').textContent = 'İkiniz de "Hazırım" deyince oyun otomatik başlar.';
+    }
+  });
+
+  // ==================================================================
+  // EKRAN 3: Oyun başlangıcı
+  // ==================================================================
+  socket.on('gameStarted', ({ players, endsAt, duration }) => {
+    setupNames(players);
+    state.endsAt = endsAt;
+    state.duration = duration;
+    showScreen('#screen-game');
+    renderPlayers(players);
+    startClock();
+    $('#round-info').textContent = 'Kapıya ilk ziyaretçiler yaklaşıyor...';
+  });
+
+  function setupNames(players) {
+    const oppId = Object.keys(players).find((id) => id !== state.myId);
+    if (players[state.myId]) $('#me-name').textContent = players[state.myId].name;
+    if (oppId) {
+      state.oppName = players[oppId].name;
+      $('#opp-name').textContent = players[oppId].name;
+    }
+  }
+
+  function startClock() {
+    clearInterval(state.clockInterval);
+    state.clockInterval = setInterval(() => {
+      const remaining = Math.max(0, state.endsAt - Date.now());
+      const mins = Math.floor(remaining / 60000);
+      const secs = Math.floor((remaining % 60000) / 1000);
+      $('#game-clock').textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      if (remaining <= 0) clearInterval(state.clockInterval);
+    }, 250);
+  }
+
+  // ==================================================================
+  // Oyun durumu render'ı (köylü/asker/ekonomi barları)
+  // ==================================================================
+  socket.on('gameStateUpdate', ({ players }) => renderPlayers(players));
+
+  function renderPlayers(players) {
+    const oppId = Object.keys(players).find((id) => id !== state.myId);
+    const me = players[state.myId];
+    const opp = players[oppId];
+    if (me) renderSide('me', me);
+    if (opp) renderSide('opp', opp);
+
+    // Sabotaj / akın butonları sadece bana ait
+    if (me) {
+      const sabBtn = $('#btn-sabotage');
+      sabBtn.disabled = !me.canSabotage;
+      const raidBtn = $('#btn-raid');
+      raidBtn.disabled = !me.raidReady;
+      raidBtn.textContent = me.raidReady ? '⚔️ Akına Çık' : `⚔️ Akın (${me.soldiers}/8 asker)`;
+    }
+  }
+
+  function renderSide(prefix, p) {
+    const maxVillagers = 40; // bar ölçeklemesi için tavan referans
+    const maxSoldiers = 16;
+    const vPct = Math.min(100, (p.villagers / maxVillagers) * 100);
+    const sPct = Math.min(100, (p.soldiers / maxSoldiers) * 100);
+
+    animateNumber(`#${prefix}-villagers-num`, p.villagers);
+    animateNumber(`#${prefix}-soldiers-num`, p.soldiers);
+    $(`#${prefix}-villagers-bar`).style.width = `${vPct}%`;
+    $(`#${prefix}-soldiers-bar`).style.width = `${sPct}%`;
+    $(`#${prefix}-economy-num`).textContent = p.economy;
+
+    const streakEl = $(`#${prefix}-streak`);
+    if (p.streak >= 2) {
+      streakEl.hidden = false;
+      $(`#${prefix}-streak-count`).textContent = p.streak;
+    } else {
+      streakEl.hidden = true;
+    }
+
+    if (!p.alive) {
+      $(`#panel-${prefix === 'me' ? 'me' : 'opp'}`).style.opacity = '0.5';
+    }
+  }
+
+  const lastNumbers = {};
+  function animateNumber(sel, value) {
+    const el = $(sel);
+    const prev = lastNumbers[sel];
+    el.textContent = value;
+    if (prev !== undefined && value < prev) {
+      const panel = el.closest('.castle-panel');
+      if (panel) {
+        panel.classList.remove('shake');
+        void panel.offsetWidth; // reflow ile animasyonu yeniden tetikle
+        panel.classList.add('shake');
+      }
+    }
+    lastNumbers[sel] = value;
+  }
+
+  // ==================================================================
+  // Ziyaretçi bildirimi (rakip tarafında soru geldiğinde bilgi ver)
+  // ==================================================================
+  socket.on('opponentVisitor', ({ visitor }) => {
+    $('#opp-status').textContent = `${visitor} kapıya geldi, cevap bekleniyor...`;
+  });
+
+  // ==================================================================
+  // Soru modalı
+  // ==================================================================
+  const VISITOR_EMOJI = {
+    'Köylü': '🧑‍🌾',
+    'Bilgin': '🧙',
+    'Tüccar': '🧑‍💼',
+    'Gizemli Yolcu': '🥷',
+    'Yaşlı Bilge': '👴',
+  };
+
+  socket.on('newQuestion', (q) => {
+    state.currentQuestion = { id: q.id, timeLimit: q.timeLimit, startedAt: Date.now() };
+    $('#visitor-emoji').textContent = VISITOR_EMOJI[q.visitor] || '❓';
+    $('#visitor-type').textContent = q.visitor;
+    $('#visitor-category').textContent = `${q.category} · ${difficultyLabel(q.difficulty)}`;
+    $('#question-text').textContent = q.question;
+    $('#round-info').textContent = `${q.visitor} sana bir soru soruyor!`;
+
+    const optionsBox = $('#question-options');
+    optionsBox.innerHTML = '';
+    q.options.forEach((opt, idx) => {
+      const btn = document.createElement('button');
+      btn.className = 'option-btn';
+      btn.textContent = opt;
+      btn.addEventListener('click', () => submitAnswer(idx, btn));
+      optionsBox.appendChild(btn);
+    });
+
+    $('#question-modal').hidden = false;
+    startQuestionTimer(q.timeLimit);
+  });
+
+  function difficultyLabel(d) {
+    return d === 'easy' ? 'Kolay' : d === 'medium' ? 'Orta' : 'Zor';
+  }
+
+  function startQuestionTimer(timeLimitMs) {
+    clearInterval(state.questionInterval);
+    const ring = $('#timer-ring-fg');
+    const CIRCUMFERENCE = 119; // 2*PI*19 yaklaşık, style.css'teki stroke-dasharray ile eşleşir
+    const secondsLabel = $('#timer-seconds');
+    const start = Date.now();
+
+    state.questionInterval = setInterval(() => {
+      const elapsed = Date.now() - start;
+      const remaining = Math.max(0, timeLimitMs - elapsed);
+      const pct = remaining / timeLimitMs;
+      ring.style.strokeDashoffset = String(CIRCUMFERENCE * (1 - pct));
+      secondsLabel.textContent = Math.ceil(remaining / 1000);
+      if (pct < 0.3) ring.style.stroke = '#A23B2E';
+      if (remaining <= 0) clearInterval(state.questionInterval);
+    }, 100);
+  }
+
+  function submitAnswer(index, btnEl) {
+    if (!state.currentQuestion) return;
+    $$('.option-btn').forEach((b) => (b.disabled = true));
+    socket.emit('answerQuestion', {
+      roomCode: state.roomCode,
+      questionId: state.currentQuestion.id,
+      answerIndex: index,
+    });
+  }
+
+  socket.on('answerResult', ({ correct, correctIndex }) => {
+    clearInterval(state.questionInterval);
+    const buttons = $$('.option-btn');
+    buttons.forEach((b, idx) => {
+      b.disabled = true;
+      if (idx === correctIndex) b.classList.add('correct');
+      else if (!correct) b.classList.add('wrong');
+    });
+    toast(correct ? '✅ Doğru cevap! Köy sevindi.' : '💀 Yanlış cevap...');
+    setTimeout(() => {
+      $('#question-modal').hidden = true;
+      state.currentQuestion = null;
+      $('#round-info').textContent = 'Yeni bir ziyaretçi yola çıktı...';
+      $('#opp-status').textContent = 'Sakin...';
+    }, 1100);
+  });
+
+  // ==================================================================
+  // Sabotaj / Akın
+  // ==================================================================
+  $('#btn-sabotage').addEventListener('click', () => {
+    socket.emit('triggerSabotage', { roomCode: state.roomCode });
+  });
+  $('#btn-raid').addEventListener('click', () => {
+    socket.emit('triggerRaid', { roomCode: state.roomCode });
+  });
+
+  socket.on('sabotaged', ({ by }) => {
+    toast(`🗡️ ${by} sana sabotaj yaptı! Bir sonraki soru zor ve süre kısa.`);
+  });
+
+  socket.on('raidDenied', ({ reason }) => {
+    toast(`⚠️ ${reason}`);
+  });
+
+  socket.on('raidResult', ({ attacker, defender, success, stolenVillagers, stolenSoldiers, lostSoldiers }) => {
+    if (success) {
+      toast(`⚔️ ${attacker}, ${defender}'den ${stolenVillagers} köylü çaldı!`);
+    } else {
+      toast(`🛡️ ${defender}, ${attacker}'in akınını püskürttü!`);
+    }
+  });
+
+  // ==================================================================
+  // Savaş günlüğü
+  // ==================================================================
+  socket.on('logEntry', (entry) => {
+    const body = $('#log-body');
+    const line = document.createElement('div');
+    line.className = `log-line ${entry.type}`;
+    const time = new Date(entry.ts).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    line.textContent = `[${time}] ${entry.message}`;
+    body.prepend(line);
+    while (body.children.length > 50) body.removeChild(body.lastChild);
+  });
+
+  // ==================================================================
+  // Rakip ayrıldı
+  // ==================================================================
+  socket.on('opponentLeft', ({ name }) => {
+    toast(`🚪 ${name} oyundan ayrıldı.`);
+  });
+
+  // ==================================================================
+  // Oyun sonu
+  // ==================================================================
+  socket.on('gameOver', ({ winnerId, winnerName, players, reason }) => {
+    clearInterval(state.clockInterval);
+    clearInterval(state.questionInterval);
+    $('#question-modal').hidden = true;
+
+    const iAmWinner = winnerId === state.myId;
+    const isDraw = !winnerId;
+
+    $('#gameover-emblem').textContent = isDraw ? '🤝' : iAmWinner ? '🏆' : '🏳️';
+    $('#gameover-title').textContent = isDraw ? 'Berabere!' : iAmWinner ? 'Zafer Senin!' : 'Kalen Düştü...';
+    $('#gameover-sub').textContent = reasonText(reason, iAmWinner, isDraw);
+
+    const statsBox = $('#gameover-stats');
+    statsBox.innerHTML = '';
+    Object.values(players).forEach((p) => {
+      const row = document.createElement('div');
+      row.className = 'gameover-stat-row';
+      const you = p.id === state.myId ? ' (Sen)' : '';
+      row.innerHTML = `<span>${escapeHtml(p.name)}${you}</span><span>👤 ${p.villagers} · 🗡️ ${p.soldiers}</span>`;
+      statsBox.appendChild(row);
+    });
+
+    $('#gameover-modal').hidden = false;
+  });
+
+  function reasonText(reason, iAmWinner, isDraw) {
+    if (isDraw) return 'İki kale de eşit güçte kaldı.';
+    if (reason === 'elimination') return iAmWinner ? 'Rakibinin kalesi tamamen çöktü!' : 'Kalen tamamen çöktü.';
+    if (reason === 'opponent_left') return iAmWinner ? 'Rakibin oyunu terk etti.' : '';
+    return iAmWinner ? 'Süre doldu, en güçlü kale sensin!' : 'Süre doldu, rakibin daha güçlüydü.';
+  }
+
+  $('#btn-play-again').addEventListener('click', () => {
+    window.location.href = window.location.pathname;
+  });
+
+  // ---------------- Yardımcı ----------------
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+})();
