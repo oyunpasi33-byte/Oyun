@@ -1,0 +1,17 @@
+{
+  "name": "kale-yarismasi-server",
+  "version": "1.0.0",
+  "description": "İki oyunculu, gerçek zamanlı RPG-strateji bilgi yarışması sunucusu",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
